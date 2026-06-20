@@ -282,3 +282,97 @@ zone matching a few hundred rows), but the index lookup and recheck overhead sti
 costs more than just scanning straight through. Confirms the broader lesson from
 earlier sections: an index's value depends on the specific values being queried,
 not just whether the column is indexed in general.
+
+## CTEs — Materialized vs Inlined
+
+```sql
+-- Common Table Expression (CTE)
+-- First with materialize
+EXPLAIN ANALYZE
+WITH vendor_cte AS MATERIALIZED(
+	SELECT * FROM yellow_trips
+	WHERE "VendorID" = 2
+) SELECT * FROM vendor_cte WHERE total_amount > 1000;
+-- Execution Time: ~11,877 ms
+-- Vendor 2 (~3M rows) fully computed and spilled to disk (444MB temp file)
+-- BEFORE total_amount filter is applied. Final result: only 3 rows.
+-- Cannot use vendor_to_amount_index — by the second pass it's no longer
+-- querying yellow_trips directly, just the isolated stored CTE result.
+
+-- Now with inline
+EXPLAIN ANALYZE
+WITH vendor_cte AS NOT MATERIALIZED(
+	SELECT * FROM yellow_trips
+	WHERE "VendorID" = 2
+) SELECT * FROM vendor_cte WHERE total_amount > 1000;
+-- Execution Time: ~34 ms (~350x faster)
+-- Postgres rewrites/merges the CTE into the outer query (same effect as
+-- pasting its definition directly where referenced), so both conditions
+-- get combined into a single Index Scan using vendor_to_amount_index.
+```
+
+**Finding:** Since Postgres 12, CTEs are inlined by default unless forced otherwise
+or referenced multiple times. Materialization computes the CTE in full isolation,
+blind to any filters applied afterward — wasted work when the outer query would
+have filtered the result down dramatically. `AS MATERIALIZED` / `AS NOT MATERIALIZED`
+let you override the planner's default choice explicitly.
+
+### Materialization can still help — combined with IN / BitmapAnd
+
+```sql
+-- Distribution check first
+SELECT "PULocationID", COUNT(*) AS count
+FROM yellow_trips
+GROUP BY "PULocationID"
+ORDER BY count DESC;
+
+-- Filtering for several specific zones at once — IN() is rewritten internally
+-- as "= ANY(array)", a single membership check, not separate OR'd lookups.
+
+SELECT * FROM pg_indexes WHERE tablename = 'yellow_trips';
+-- only amount_index and vendor_to_amount_index exist at this point —
+-- nothing covers PULocationID yet
+
+EXPLAIN ANALYZE
+WITH pickup_cte AS MATERIALIZED(
+	SELECT * FROM yellow_trips
+	WHERE "PULocationID" IN (138, 50, 98, 187, 199, 165)
+) SELECT * FROM pickup_cte WHERE total_amount > 100;
+-- Execution Time: ~2468 ms, ~19MB spilled to disk
+-- Smaller cost than the Vendor 2 case since the 6 zones combined match
+-- far fewer rows (~125K vs ~3M) — disk spill cost is proportional to
+-- the actual intermediate result size, not a fixed penalty.
+
+EXPLAIN ANALYZE
+WITH pickup_cte AS NOT MATERIALIZED(
+	SELECT * FROM yellow_trips
+	WHERE "PULocationID" IN (138, 50, 98, 187, 199, 165)
+) SELECT * FROM pickup_cte WHERE total_amount > 100;
+-- Execution Time: ~2672 ms — no real improvement over materialized here.
+-- No index on PULocationID yet, so inlining alone can't help; planner
+-- leads with amount_index (total_amount > 100) instead and filters
+-- PULocationID row-by-row afterward.
+
+CREATE INDEX pickup_index ON yellow_trips ("PULocationID");
+
+-- Now after creating pickup index
+EXPLAIN ANALYZE
+WITH pickup_cte AS NOT MATERIALIZED(
+	SELECT * FROM yellow_trips
+	WHERE "PULocationID" IN (138, 50, 98, 187, 199, 165)
+) SELECT * FROM pickup_cte WHERE total_amount > 100;
+-- Execution Time: ~142 ms (~17-19x faster than either previous attempt)
+-- Plan shows BitmapAnd: two independent Bitmap Index Scans (amount_index,
+-- pickup_index) run separately, their bitmaps combined with logical AND,
+-- THEN a single Bitmap Heap Scan fetches only rows matching both.
+```
+
+**Finding:** `BitmapAnd` lets Postgres combine multiple single-column indexes
+on the fly for whatever filter combination a query happens to need — a flexible
+alternative to building a dedicated composite index for every possible filter
+pairing. Composite indexes (like `vendor_to_amount_index`) still win when one
+specific combination is queried often and predictably; single-column indexes
+combined via `BitmapAnd` scale better when query patterns are varied/unpredictable,
+since maintaining a composite index for every combination would be impractical
+(every index adds write overhead and storage cost regardless of use).
+

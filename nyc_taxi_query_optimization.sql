@@ -207,3 +207,53 @@ DROP INDEX pickup_index;
 EXPLAIN ANALYZE
 SELECT * FROM yellow_trips
 WHERE "PULocationID" = 237;
+
+
+-- Common Table Expression (CTE)
+
+-- First with materialize
+EXPLAIN ANALYZE
+WITH vendor_cte AS MATERIALIZED(
+	SELECT * FROM yellow_trips
+	WHERE "VendorID" = 2
+) SELECT * FROM vendor_cte WHERE total_amount > 1000;
+
+-- Now with inline
+EXPLAIN ANALYZE
+WITH vendor_cte AS NOT MATERIALIZED(
+	SELECT * FROM yellow_trips
+	WHERE "VendorID" = 2
+) SELECT * FROM vendor_cte WHERE total_amount > 1000;
+
+-- Check index tables 
+SELECT * FROM pg_indexes
+WHERE tablename = 'yellow_trips';
+
+-- Using cte for PULocationID
+SELECT "PULocationID", COUNT(*) AS count
+FROM yellow_trips
+GROUP BY "PULocationID"
+ORDER BY count DESC;
+
+EXPLAIN ANALYZE
+WITH pickup_cte AS MATERIALIZED(
+	SELECT * FROM yellow_trips
+	WHERE "PULocationID" IN (138, 50, 98, 187, 199, 165)
+) SELECT * FROM pickup_cte WHERE total_amount > 100;
+
+
+EXPLAIN ANALYZE
+WITH pickup_cte AS NOT MATERIALIZED(
+	SELECT * FROM yellow_trips
+	WHERE "PULocationID" IN (138, 50, 98, 187, 199, 165)
+) SELECT * FROM pickup_cte WHERE total_amount > 100;
+
+CREATE INDEX pickup_index
+ON yellow_trips ("PULocationID");
+
+-- Now after creating pickup index
+EXPLAIN ANALYZE
+WITH pickup_cte AS NOT MATERIALIZED(
+	SELECT * FROM yellow_trips
+	WHERE "PULocationID" IN (138, 50, 98, 187, 199, 165)
+) SELECT * FROM pickup_cte WHERE total_amount > 100;
