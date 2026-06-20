@@ -197,3 +197,88 @@ Indexes help when a query needs a small, selective subset of rows. When a query
 necessarily touches most/all of a table (no filter, or low-selectivity filter), a
 sequential or hash-based scan is cheaper — and the planner will correctly choose that
 over an existing index. Always verify with `EXPLAIN ANALYZE` rather than assuming.
+
+## Partitioning — Investigation and Findings
+
+Before partitioning any table, checked whether real columns in `yellow_trips` had a
+distribution that would actually benefit from it. Partitioning only pays off when:
+data is reasonably balanced across partitions, **and** queries consistently filter on
+the partition key. Three candidate columns were tested — none qualified.
+
+```sql
+-- Check distribution in VendorID
+SELECT "VendorID", COUNT(total_amount) AS total
+FROM yellow_trips
+GROUP BY "VendorID";
+-- Skewed: a single vendor holds ~98% of rows. Partitioning by VendorID
+-- would produce one massive partition and several near-empty ones.
+
+-- Check time distribution
+SELECT DISTINCT(tpep_pickup_datetime)
+FROM yellow_trips
+ORDER BY tpep_pickup_datetime ASC;
+-- Only one month of data is loaded, so a date-range partition would
+-- contain ~99.9% of rows in a single "April" partition — no pruning benefit.
+-- (Would become worthwhile once multiple months/years are loaded.)
+
+-- CREATE TABLE yellow_trips_by_time
+-- (LIKE yellow_trips)
+-- PARTITION BY RANGE (tpep_pickup_datetime);
+-- ^ left unused for the reason above
+
+-- Check distribution in total_amount ($10 buckets)
+SELECT COUNT(*) AS Buckets
+FROM yellow_trips
+GROUP BY ((FLOOR(total_amount / 10)) * 10);
+-- Heavily right-skewed: a couple of buckets in the $10-30 range absorb
+-- the overwhelming majority of rows, while dozens of high-fare buckets
+-- have single-digit counts. Equal-width range partitions would be useless;
+-- unequal-width partitions would still leave a few dominant partitions.
+
+-- Check distribution in PULocationID
+SELECT "PULocationID", COUNT(*) AS Count
+FROM yellow_trips
+GROUP BY "PULocationID"
+ORDER BY COUNT DESC;
+-- Also skewed: top zones (e.g. 237, 161, 236) hold 150K-180K+ rows each,
+-- while the long tail of 200+ zones holds a handful of rows each.
+-- Partitioning by zone would mean creating 265 partitions, most nearly
+-- empty, for no real pruning benefit — not worth the overhead.
+```
+
+**Conclusion:** none of VendorID, total_amount, or PULocationID have a distribution
+that justifies partitioning at the current data scale. Partitioning would only become
+worthwhile with multiple months/years of data partitioned by pickup date (the column
+the source files are already organized by), where genuine range-based pruning and
+archiving become possible.
+
+### Index vs. partition trade-off check (PULocationID)
+
+Even though partitioning didn't make sense for `PULocationID`, tested whether an index
+on it helps for a single dense zone (`PULocationID = 237`, ~183K matching rows out of
+~3.8M, ~5% selectivity):
+
+```sql
+-- With pickup_index in place — bitmap scan, partially "lossy" (falls back to
+-- page-level tracking when too many matches to track exactly), with recheck overhead
+EXPLAIN ANALYZE
+SELECT * FROM yellow_trips
+WHERE "PULocationID" = 237;
+-- Execution Time: ~2837 ms
+
+DROP INDEX pickup_index;
+
+-- Without the index — parallel sequential scan
+EXPLAIN ANALYZE
+SELECT * FROM yellow_trips
+WHERE "PULocationID" = 237;
+-- Execution Time: ~1275 ms
+```
+
+**Finding:** for this moderately-common zone (~5% selectivity), the plain sequential
+scan beat the bitmap index scan by more than 2x. This selectivity range sits in a
+middle zone — too large a result set for the index to win cleanly (unlike a rare
+zone matching a few hundred rows), but the index lookup and recheck overhead still
+costs more than just scanning straight through. Confirms the broader lesson from
+earlier sections: an index's value depends on the specific values being queried,
+not just whether the column is indexed in general.

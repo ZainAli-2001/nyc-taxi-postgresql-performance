@@ -101,7 +101,6 @@ DROP INDEX amount_to_vendor_index;
 
 -- Windows Functions
 
-
 SELECT "VendorID", COUNT(total_amount) AS total
 FROM yellow_trips
 GROUP BY "VendorID";
@@ -161,3 +160,50 @@ WHERE t."Zone" = 'Bath Beach';
 
 Select * from taxi_zone_lookup
 
+
+-- Partition
+-- Lets check if there is any column worth partitioning here
+
+-- Check for distribution in VendorID
+SELECT "VendorID", COUNT(total_amount) AS total
+FROM yellow_trips
+GROUP BY "VendorID";
+-- VendorID is also skewed with a single vendor taking 98% of data
+-- check for time distribution
+SELECT DISTINCT(tpep_pickup_datetime)
+FROM yellow_trips
+ORDER BY tpep_pickup_datetime ASC;
+
+-- timestamp is not the ideal for partitioning here
+-- CREATE TABLE yellow_trips_by_time
+-- (LIKE yellow_trips) 
+-- PARTITION BY RANGE (tpep_pickup_datetime);
+
+-- Check for distribution in total_amount
+SELECT COUNT(*) AS Buckets
+FROM yellow_trips
+GROUP BY ((FLOOR(total_amount/10))*10);
+-- Data is right skewed 
+-- a single bucket range is absorbing the overwhelming majority of rows
+-- while dozens of buckets at the high end have single-digit counts
+
+-- Check for distribution in PULocationID
+SELECT "PULocationID", COUNT(*) AS Count
+FROM yellow_trips
+GROUP BY "PULocationID"
+ORDER BY COUNT DESC;
+-- Data is also skewed here 
+
+-- Hence, we should not use partition here
+
+
+-- Check if adding index to PULocationID benefit query
+EXPLAIN ANALYZE
+SELECT * FROM yellow_trips
+WHERE "PULocationID" = 237;
+
+DROP INDEX pickup_index;
+
+EXPLAIN ANALYZE
+SELECT * FROM yellow_trips
+WHERE "PULocationID" = 237;
