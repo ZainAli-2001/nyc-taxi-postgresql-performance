@@ -257,3 +257,46 @@ WITH pickup_cte AS NOT MATERIALIZED(
 	SELECT * FROM yellow_trips
 	WHERE "PULocationID" IN (138, 50, 98, 187, 199, 165)
 ) SELECT * FROM pickup_cte WHERE total_amount > 100;
+
+-- Table Bloat ,VACUUM and ANALYZE
+
+-- Check for any dead row count
+SELECT n_dead_tup FROM pg_stat_user_tables
+WHERE relname = 'yellow_trips';
+
+EXPLAIN ANALYZE
+SELECT "VendorID", COUNT(*)
+FROM yellow_trips
+GROUP BY "VendorID";
+
+-- We pick a vendor with lower row count
+-- Update vendorID 6 to 999 to observe any bloat in the table
+EXPLAIN ANALYZE
+UPDATE yellow_trips
+SET "VendorID" = 999
+WHERE "VendorID" = 6;
+
+-- Once again pick for bloat
+SELECT n_dead_tup FROM pg_stat_user_tables
+WHERE relname = 'yellow_trips';
+-- 9863 dead rows detected
+
+-- VACUUM the dead rows
+VACUUM yellow_trips;
+
+SELECT n_dead_tup FROM pg_stat_user_tables
+WHERE relname = 'yellow_trips';
+-- The dead rows got deleted
+
+-- Revert the updated rows back
+EXPLAIN ANALYZE
+UPDATE yellow_trips
+SET "VendorID" = 6
+WHERE "VendorID" = 999;
+
+ANALYZE yellow_trips;
+
+EXPLAIN ANALYZE
+SELECT "VendorID", COUNT(*)
+FROM yellow_trips
+GROUP BY "VendorID";

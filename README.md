@@ -376,3 +376,97 @@ combined via `BitmapAnd` scale better when query patterns are varied/unpredictab
 since maintaining a composite index for every combination would be impractical
 (every index adds write overhead and storage cost regardless of use).
 
+## Table Bloat, VACUUM, and ANALYZE
+
+### What causes bloat
+
+Postgres uses MVCC (Multi-Version Concurrency Control): every `UPDATE` writes a brand
+new row version rather than modifying in place, and every `DELETE` just marks a row
+dead rather than erasing it immediately. Old versions stay on disk — scoped only to
+the rows actually changed, not the whole table — until nothing could possibly still
+need them, and even then they aren't reclaimed until `VACUUM` runs (manually or via
+autovacuum). This exists so concurrent transactions always see a consistent snapshot:
+a long-running read should never see data change underneath it mid-query.
+
+Common bloat sources: routine `UPDATE`/`DELETE` activity, long-running or abandoned
+"idle in transaction" sessions (forces retention of old versions across the *whole*
+database, not just one table), and autovacuum falling behind on high-write tables.
+
+```sql
+-- Check for any dead row count
+SELECT n_dead_tup FROM pg_stat_user_tables
+WHERE relname = 'yellow_trips';
+-- 0 — clean baseline
+
+EXPLAIN ANALYZE
+SELECT "VendorID", COUNT(*)
+FROM yellow_trips
+GROUP BY "VendorID";
+-- Used Index Only Scan on vendor_to_amount_index, but with a high Heap Fetches
+-- count (282,369) — the visibility map couldn't confirm all pages were fully
+-- visible, forcing heap lookups even on a nominally "index-only" scan.
+
+-- Pick a vendor with a low row count, update it to an artificial value
+-- to generate observable bloat
+EXPLAIN ANALYZE
+UPDATE yellow_trips
+SET "VendorID" = 999
+WHERE "VendorID" = 6;
+
+SELECT n_dead_tup FROM pg_stat_user_tables
+WHERE relname = 'yellow_trips';
+-- 9862 dead rows — matches the exact row count updated, 1:1, confirming MVCC
+-- keeps old versions scoped only to the rows that actually changed.
+```
+
+### VACUUM reclaims space and refreshes the visibility map
+
+```sql
+VACUUM yellow_trips;
+
+SELECT n_dead_tup FROM pg_stat_user_tables
+WHERE relname = 'yellow_trips';
+-- back to 0
+
+-- Revert the update
+EXPLAIN ANALYZE
+UPDATE yellow_trips
+SET "VendorID" = 6
+WHERE "VendorID" = 999;
+```
+
+**Finding:** plain `VACUUM` reclaims dead-tuple space for reuse (via the Free Space
+Map — new inserts/updates can reuse freed pages instead of requesting the OS grow
+the file, which is cheaper than allocating new disk space) and updates the
+**visibility map**, but does *not* rebuild full column statistics and does *not*
+shrink the file on disk (`VACUUM FULL` does that, at the cost of locking the table).
+
+### ANALYZE refreshes planner statistics — can change the chosen strategy entirely
+
+```sql
+ANALYZE yellow_trips;
+
+EXPLAIN ANALYZE
+SELECT "VendorID", COUNT(*)
+FROM yellow_trips
+GROUP BY "VendorID";
+```
+
+**Finding:** after `ANALYZE`, the planner abandoned the Index Only Scan entirely
+and switched to **Parallel Seq Scan + HashAggregate** — consistently ~1865-1895ms
+across repeated runs (first run showed 8720ms, attributable to cold cache/disk
+read overhead, not a plan difference — buffer reads were similar across all three
+runs). This ended up faster than the earlier Index Only Scan approach (~3180ms),
+not by fixing the heap-fetch problem, but because accurate statistics on a
+low-cardinality column (`VendorID`, only 4 distinct values) led the planner to a
+genuinely better strategy for this query shape.
+
+## Core takeaway
+
+`VACUUM` and `ANALYZE` solve different problems — `VACUUM`
+reclaims space and keeps the visibility map current (affecting whether Index Only
+Scans can skip the heap); `ANALYZE` keeps the planner's cost estimates accurate
+(affecting *which* strategy gets chosen at all). Stale statistics can cause the
+planner to pick a worse plan even when a perfectly good index exists; fresher
+statistics don't always mean "the same plan gets faster" — they can mean the
+planner switches strategies entirely.
