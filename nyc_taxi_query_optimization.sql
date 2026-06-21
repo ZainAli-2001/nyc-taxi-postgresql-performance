@@ -229,12 +229,13 @@ WITH vendor_cte AS NOT MATERIALIZED(
 SELECT * FROM pg_indexes
 WHERE tablename = 'yellow_trips';
 
--- Using cte for PULocationID
+-- Check for the pickup location distribution
 SELECT "PULocationID", COUNT(*) AS count
 FROM yellow_trips
 GROUP BY "PULocationID"
 ORDER BY count DESC;
 
+-- Using cte for PULocationID
 EXPLAIN ANALYZE
 WITH pickup_cte AS MATERIALIZED(
 	SELECT * FROM yellow_trips
@@ -300,3 +301,64 @@ EXPLAIN ANALYZE
 SELECT "VendorID", COUNT(*)
 FROM yellow_trips
 GROUP BY "VendorID";
+
+-- Query Planner Statistics
+
+SELECT * FROM pg_stats
+WHERE tablename = 'yellow_trips';
+
+SELECT COUNT(DISTINCT("PULocationID"))
+FROM yellow_trips;
+
+SELECT COUNT(DISTINCT("DOLocationID"))
+FROM yellow_trips;
+
+SELECT COUNT(*)
+FROM taxi_zone_lookup;
+
+-- Set pre column statistics target
+ALTER TABLE yellow_trips
+ALTER COLUMN "PULocationID"
+SET STATISTICS 1000;
+
+ANALYZE yellow_trips;
+
+SELECT * FROM pg_stats
+WHERE tablename = 'yellow_trips';
+
+-- Force feed the original distinct value count
+ALTER TABLE yellow_trips 
+ALTER COLUMN "PULocationID" 
+SET (n_distinct = 261);
+
+ANALYZE yellow_trips;
+
+SELECT * FROM pg_stats
+WHERE tablename = 'yellow_trips';
+
+EXPLAIN ANALYZE
+SELECT * FROM yellow_trips
+WHERE "PULocationID" = 237;
+
+SET work_mem = "20MB";
+SHOW work_mem;
+
+EXPLAIN ANALYZE
+SELECT * FROM yellow_trips
+WHERE "PULocationID" = 237;
+
+-- Partial Index
+
+EXPLAIN ANALYZE
+SELECT * FROM yellow_trips
+WHERE "VendorID" = 6 AND "PULocationID" = 53;
+
+CREATE INDEX partial_vendor_index
+ON yellow_trips ("VendorID")
+WHERE "VendorID" = 6;
+
+EXPLAIN ANALYZE
+SELECT * FROM yellow_trips
+WHERE "VendorID" = 6 AND "PULocationID" = 53;
+
+

@@ -470,3 +470,139 @@ Scans can skip the heap); `ANALYZE` keeps the planner's cost estimates accurate
 planner to pick a worse plan even when a perfectly good index exists; fresher
 statistics don't always mean "the same plan gets faster" — they can mean the
 planner switches strategies entirely.
+
+## Query Planner Statistics (`pg_stats`) and Partial Indexes
+
+### What's actually inside pg_stats
+
+```sql
+SELECT * FROM pg_stats
+WHERE tablename = 'yellow_trips';
+```
+
+This is the readable view over `pg_statistic` — the data `ANALYZE` builds and the
+planner actually reads when estimating costs. Key columns per row (one row per
+table column):
+
+- **`null_frac`** — fraction of rows that are NULL for that column
+- **`n_distinct`** — estimated number of distinct values (an *estimate* based on a
+  sample, not an exact count — see below)
+- **`most_common_vals`** / **`most_common_freqs`** — the most frequent values and
+  what fraction of rows each one represents
+- **`histogram_bounds`** — boundary values dividing the column into equal-frequency
+  buckets, used for range-filter selectivity estimates
+
+`VendorID`'s `most_common_freqs` (`{0.7854, 0.1996, 0.0125, 0.0025}`) matched the
+real skew found via `GROUP BY` on day one almost exactly — confirms `pg_stats` is
+genuinely what drives the planner's row estimates.
+
+### n_distinct is a sample-based estimate, not an exact count
+
+```sql
+SELECT COUNT(DISTINCT("PULocationID")) FROM yellow_trips;  -- 261 (true value)
+SELECT COUNT(DISTINCT("DOLocationID")) FROM yellow_trips;  -- 261
+SELECT COUNT(*) FROM taxi_zone_lookup;                       -- 265
+```
+
+At the default statistics target, `pg_stats` reported `n_distinct = 227` for
+`PULocationID` — a real ~13% gap from the true `261`. Since `ANALYZE` only samples
+a subset of rows rather than scanning the full table, high-cardinality, skewed
+columns are harder to estimate accurately — the estimator can underrepresent the
+long tail of rare values regardless of sample size.
+
+**Consequence:** an underestimated `n_distinct` makes the planner think each
+individual value represents a *larger* average share of the table than it really
+does — i.e., it assumes filters are *less* selective than they actually are,
+biasing the planner away from index usage even when an index would help.
+
+```sql
+-- Increase the sampling depth for this specific column (default target is 100, max 10,000)
+ALTER TABLE yellow_trips
+ALTER COLUMN "PULocationID"
+SET STATISTICS 1000;
+
+ANALYZE yellow_trips;  -- required — the new target only applies on the next ANALYZE
+
+SELECT * FROM pg_stats WHERE tablename = 'yellow_trips';
+-- n_distinct improved: 227 → 247, still short of the true 261
+```
+
+```sql
+-- Force the accurate value directly instead of relying on sampling
+ALTER TABLE yellow_trips
+ALTER COLUMN "PULocationID"
+SET (n_distinct = 261);
+
+ANALYZE yellow_trips;
+
+SELECT * FROM pg_stats WHERE tablename = 'yellow_trips';
+```
+
+```sql
+EXPLAIN ANALYZE
+SELECT * FROM yellow_trips
+WHERE "PULocationID" = 237;
+-- With corrected n_distinct, planner now chooses Bitmap Index Scan on pickup_index
+-- (previously chose Seq Scan with the underestimated n_distinct).
+-- Execution Time: ~1548ms — but still shows "lossy" heap blocks
+-- (Heap Blocks: exact=33890 lossy=33080), since work_mem can't track all
+-- ~183K matching rows exactly, falling back to page-level tracking and a
+-- costly recheck against every row on each flagged page.
+```
+
+```sql
+-- Test whether more work_mem eliminates the "lossy" fallback
+SET work_mem = '20MB';
+SHOW work_mem;
+
+EXPLAIN ANALYZE
+SELECT * FROM yellow_trips
+WHERE "PULocationID" = 237;
+-- Heap Blocks: exact=66970 — fully exact, no lossy fallback
+-- Execution Time: ~773ms — ~2x faster than the lossy run, and finally beats
+-- the plain sequential scan baseline (~1275ms) for this same dense zone.
+```
+
+**Finding:** an index's real-world performance for a given query depends on
+*two independent, separately-tunable factors* — accurate planner statistics
+(so the index gets chosen with appropriate confidence) and sufficient `work_mem`
+(so a bitmap scan can stay "exact" instead of degrading to "lossy"). Fixing only
+one wasn't enough; fixing both together is what finally let the index win.
+
+### Partial Indexes — indexing only a meaningful slice
+
+A partial index covers only rows matching a condition specified at creation time,
+rather than the whole table. Best candidate: a value that's genuinely *rare*, not
+the dominant majority — building one on Vendor 2 (~78% of rows) would barely be
+smaller than a full index and wouldn't help, per the same selectivity lesson from
+day one. Vendor 6 (~9,862 rows out of 3.8M) is the right candidate.
+
+```sql
+-- Baseline: full indexes only (vendor_to_amount_index, pickup_index)
+EXPLAIN ANALYZE
+SELECT * FROM yellow_trips
+WHERE "VendorID" = 6 AND "PULocationID" = 53;
+-- BitmapAnd combining pickup_index + vendor_to_amount_index
+-- Execution Time: ~8.887ms
+-- vendor_to_amount_index scan still has to check Index Cond ("VendorID" = 6)
+-- explicitly — it covers all vendors, so the condition must be verified.
+
+CREATE INDEX partial_vendor_index
+ON yellow_trips ("VendorID")
+WHERE "VendorID" = 6;
+
+EXPLAIN ANALYZE
+SELECT * FROM yellow_trips
+WHERE "VendorID" = 6 AND "PULocationID" = 53;
+-- BitmapAnd combining pickup_index + partial_vendor_index
+-- Execution Time: ~2.167ms — roughly 4x faster, with a cheaper estimated
+-- cost too (cost=100.28..104.29 vs 236.97..240.99).
+```
+
+**Finding:** the `Bitmap Index Scan` on `partial_vendor_index` shows **no
+`Index Cond`** at all for `VendorID` — since every entry in the index is already
+guaranteed to satisfy `VendorID = 6` by definition, Postgres never needs to
+re-check it. A partial index is smaller (only the rare slice is indexed, less
+disk and write overhead than a full index) and faster to use (no redundant
+condition checking) than a full index covering the entire table — the most
+surgical tool for "this slice is small and rare, but queried often."
